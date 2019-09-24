@@ -1,5 +1,7 @@
 # cython: profile=False
 
+from itertools import product
+
 cimport numpy as np
 from numpy cimport (int8_t, int32_t, int64_t, import_array, ndarray,
                     NPY_INT64, NPY_DATETIME, NPY_TIMEDELTA)
@@ -1716,6 +1718,336 @@ class DateParseError(ValueError):
 cdef object _TIMEPAT = re.compile(r'^([01]?[0-9]|2[0-3]):([0-5][0-9])')
 
 
+from dateutil.parser import parse
+import re
+
+cdef list delims = ['-', '/', r'.']
+
+cdef list ymd_patterns = []
+for delim in delims + ['']:
+    p = re.compile(
+        r'^( ?\d\d(\d\d)?){delim}(\d\d?){delim}(\d\d?).*?(AM|PM|am|pm)?(Z|(\+|-)\d\d:\d\d)?$'.format(
+            delim=re.escape(delim),
+        ),
+    )
+    ymd_patterns.append((delim, p))
+
+
+ym_patterns = []
+for delim in delims:
+    p = re.compile(r'^( ?\d\d\d\d){delim}(\d\d?)'.format(
+            delim=re.escape(delim),
+        ),
+    )
+    ym_patterns.append((delim, p))
+
+cdef list mdy_patterns = []
+for delim in delims:
+    p = re.compile(
+        r'^( ?\d\d?){delim}(\d\d?){delim}(\d\d(\d\d)?).*?(AM|PM|am|pm)?(Z|(\+|-)\d\d:\d\d)?$'.format(
+            delim=re.escape(delim),
+        ),
+    )
+    mdy_patterns.append((delim, p))
+
+cdef object year_pattern = re.compile(r'^\d{4}$')
+cap_months = [
+    'Jan',
+    'Feb',
+    'Mar',
+    'Apr',
+    'May',
+    'Jun',
+    'Jul',
+    'Aug',
+    'Sep',
+    'Oct',
+    'Nov',
+    'Dec',
+]
+down_months = [m.lower() for m in cap_months]
+month_name_patterns = []
+for delim in delims:
+    month_name_patterns.append((
+        delim,
+        re.compile(r'^( ?\d\d?){delim}({m}){delim}(\d\d(\d\d)?).*?(AM|PM|am|pm)?(Z|(\+|-)\d\d:\d\d)?$'.format(
+            m='|'.join(cap_months), delim=re.escape(delim),
+        )),
+    ))
+    month_name_patterns.append((
+        delim,
+        re.compile(r'^( ?\d\d?){delim}({m}){delim}(\d\d(\d\d)?).*?(AM|PM|am|pm)?(Z|(\+|-)\d\d:\d\d)?$'.format(
+            m='|'.join(down_months), delim=re.escape(delim),
+        )),
+    ))
+
+
+cdef list natural_patterns = []
+natural_patterns.append(
+    re.compile(r'^({m}) (\d\d?), (\d\d\d\d)$'.format(m='|'.join(cap_months))),
+)
+
+cdef object time_only_pattern = re.compile(r'^\d{1,2}:\d{1,2}(:\d{1,2})?( (AM|PM|am|pm))?(Z|(\+|-)\d\d:\d\d)?$')
+cdef object int_pattern = re.compile(r'^\d+$')
+cdef object float_pattern = re.compile(r'^\d+\.\d+$')
+cdef object year_qtr = re.compile(r'^(\d{4})Q(\d)$')
+
+
+_compatible_formats = {}
+for delim, s, y in product(delims + [''],
+                           [' AM/PM', ' tz', ' AM/PM tz', ''],
+                           ['yyyy', 'yy']):
+    canonical = '{y}{delim}m{delim}d{s}'.format(y=y, delim=delim, s=s).encode()
+    for other_m, other_d in product(['m', 'mm'], ['d', 'dd']):
+        other = '{y}{delim}{m}{delim}{d}{s}'.format(
+            y=y, delim=re.escape(delim), m=other_m, d=other_d, s=s,
+        ).encode()
+        _compatible_formats.setdefault(canonical, []).append(other)
+for delim, s, y in product(delims,
+                           [' AM/PM', ' tz', ' AM/PM tz', ''],
+                           ['yyyy', 'yy']):
+    md_canonical = 'm{delim}d{delim}{y}{s}'.format(y=y, delim=delim, s=s).encode()
+    dm_canonical = 'd{delim}m{delim}{y}{s}'.format(y=y, delim=delim, s=s).encode()
+
+    for other_m, other_d in product(['m', 'mm'], ['d', 'dd']):
+        if other_m == 'mm' and other_d == 'dd':
+            continue
+
+        md_other = '{m}{delim}{d}{delim}{y}{s}'.format(
+            y=y, delim=delim, m=other_m, d=other_d, s=s,
+        ).encode()
+        _compatible_formats.setdefault(md_canonical, []).append(md_other)
+
+        dm_other = '{d}{delim}{m}{delim}{y}{s}'.format(
+            y=y, delim=delim, m=other_m, d=other_d, s=s,
+        )
+        _compatible_formats.setdefault(dm_canonical, []).append(dm_other)
+
+
+def condense_formats(formats):
+    if len(formats) < 2:
+        return None
+    for canonical, options in _compatible_formats.items():
+        if all(any(fmt == option for option in options) for fmt in formats):
+            return canonical
+    return None
+
+
+cpdef collect_date_parser_stats(x, out, parser_stats):
+    cdef bint year_exact
+    cdef bint year_2_digit
+
+    if parser_stats is None:
+        return
+    for delim, pattern in ymd_patterns:
+        m = pattern.match(x)
+        if m is not None:
+            year_exact = m.group(1).strip() == str(out.year)
+            year_2_digit = m.group(1).strip() == str(out.year)[2:]
+            if year_exact or year_2_digit:
+                if year_exact and year_2_digit:
+                    raise ValueError('cannot be exact and 2 digit')
+                if year_exact:
+                    y = 'yyyy'
+                else:
+                    y = 'yy'
+
+                if len(m.group(1)) > len(y):
+                    y = ' ' + y
+
+                if m.group(5) is not None:
+                    suffix = ' AM/PM'
+                else:
+                    suffix = ''
+
+                if m.group(6) is not None:
+                    if out.tz is None:
+                        raise ValueError('tz pattern = %r but out.tz is None' % m.group(6))
+                    if m.group(6) == 'Z':
+                        suffix += ' Z'
+                    else:
+                        suffix += ' <+- tz time>'
+                elif out.tz is not None:
+                    raise ValueError('format has not tz but out.tz is not None: %r, %s' % (x, out))
+
+                if int(m.group(3)) == out.month and int(m.group(4)) == out.day:
+                    if len(m.group(3)) == 1:
+                        mo = 'm'
+                    else:
+                        mo = 'mm'
+
+                    if len(m.group(4)) == 1:
+                        d = 'd'
+                    else:
+                        d = 'dd'
+
+                    parser_stats.increment_datetime_format('{y}{0}{m}{0}{d}{s}'.format(delim, y=y, m=mo, d=d, s=suffix))
+                elif int(m.group(3)) == out.day and int(m.group(4)) == out.month:
+                    if len(m.group(4)) == 1:
+                        mo = 'm'
+                    else:
+                        mo = 'mm'
+
+                    if len(m.group(3)) == 1:
+                        d = 'd'
+                    else:
+                        d = 'dd'
+                    parser_stats.increment_datetime_format('{y}{0}{d}{0}{m}{s}'.format(delim, y=y, d=d, m=mo, s=suffix))
+                else:
+                    continue
+                return
+    for delim, pattern in mdy_patterns:
+        m = pattern.match(x)
+        if m is not None:
+            year_exact = m.group(3) == str(out.year)
+            year_2_digit = m.group(3) == str(out.year)[2:]
+            if year_exact or year_2_digit:
+                if year_exact and year_2_digit:
+                    raise ValueError('cannot be exact and 2 digit')
+                if year_exact:
+                    y = 'yyyy'
+                else:
+                    y = 'yy'
+
+                if m.group(5) is not None:
+                    suffix = ' AM/PM'
+                else:
+                    suffix = ''
+
+                if m.group(6) is not None:
+                    if out.tz is None:
+                        raise ValueError('tz pattern = %r but out.tz is None' % m.group(6))
+                    if m.group(6) == 'Z':
+                        suffix += ' Z'
+                    else:
+                        suffix += ' <+- tz time>'
+                elif out.tz is not None:
+                    raise ValueError('format has not tz but out.tz is not None: %r, %s' % (x, out))
+
+                if int(m.group(1).strip()) == out.month and int(m.group(2)) == out.day:
+                    if len(m.group(1).strip()) == 1:
+                        mo = 'm'
+                    else:
+                        mo = 'mm'
+                    if m.group(1)[0] == ' ':
+                        mo = ' ' + mo
+
+                    if len(m.group(2)) == 1:
+                        d = 'd'
+                    else:
+                        d = 'dd'
+
+                    parser_stats.increment_datetime_format('{m}{0}{d}{0}{y}{s}'.format(delim, y=y, m=mo, d=d, s=suffix))
+                elif int(m.group(1).strip()) == out.day and int(m.group(2)) == out.month:
+                    if len(m.group(2)) == 1:
+                        mo = 'm'
+                    else:
+                        mo = 'mm'
+
+                    if len(m.group(1).strip()) == 1:
+                        d = 'd'
+                    else:
+                        d = 'dd'
+                    if m.group(1)[0] == ' ':
+                        d = ' ' + d
+
+                    parser_stats.increment_datetime_format('{d}{0}{m}{0}{y}{s}'.format(delim, y=y, d=d, m=mo, s=suffix))
+                else:
+                    continue
+                return
+    for delim, pattern in month_name_patterns:
+        m = pattern.match(x)
+        if m is not None:
+            year_exact = m.group(3) == str(out.year)
+            year_2_digit = m.group(3) == str(out.year)[2:]
+            if year_exact or year_2_digit:
+                if year_exact and year_2_digit:
+                    raise ValueError('cannot be exact and 2 digit')
+                if year_exact:
+                    y = 'yyyy'
+                else:
+                    y = 'yy'
+
+                try:
+                    month = cap_months.index(m.group(2)) + 1
+                    mo = 'Mon'
+                except ValueError:
+                    month = down_months.index(m.group(2)) + 1
+                    mo = 'mon'
+
+                if month == out.month and int(m.group(1).strip()) == out.day:
+                    if m.group(5) is not None:
+                        suffix = ' AM/PM'
+                    else:
+                        suffix = ''
+
+                    if m.group(6) is not None:
+                        if out.tz is None:
+                            raise ValueError('tz pattern = %r but out.tz is None' % m.group(6))
+                        if m.group(6) == 'Z':
+                            suffix += ' Z'
+                        else:
+                            suffix += ' <+- tz time>'
+                    elif out.tz is not None:
+                        raise ValueError('format has not tz but out.tz is not None: %r, %s' % (x, out))
+
+                    if m.group(1)[0] == ' ':
+                        d = ' d'
+                    else:
+                        d = 'd'
+
+                    parser_stats.increment_datetime_format('{d}{0}{mo}{0}{y}{s}'.format(delim, d=d, mo=mo, y=y, s=suffix))
+                    return
+    for pattern in natural_patterns:
+        m = pattern.match(x)
+        if m is not None:
+            year_exact = m.group(3) == str(out.year)
+            if year_exact:
+                month = cap_months.index(m.group(1)) + 1
+                if month == out.month and int(m.group(2)) == out.day:
+                    parser_stats.increment_datetime_format('Mon d, yyyy')
+                    return
+    for delim, pattern in ym_patterns:
+        m = pattern.match(x)
+        if m is not None:
+            if int(m.group(1)) == out.year and int(m.group(2)) == out.month:
+                if len(m.group(2)) == 1:
+                    mo = 'm'
+                else:
+                    mo = 'mm'
+
+                parser_stats.increment_datetime_format('yyyy{0}{mo}'.format(delim, mo=mo))
+                return
+
+    m = year_pattern.match(x)
+    if m is not None:
+        if int(m.group(0)) == out.year:
+            parser_stats.increment_datetime_format('yyyy')
+            return
+
+    m = int_pattern.match(x)
+    if m is not None:
+        parser_stats.increment_datetime_format('<int>')
+        return
+
+    m = float_pattern.match(x)
+    if m is not None:
+        parser_stats.increment_datetime_format('<float>')
+        return
+
+    m = time_only_pattern.match(x)
+    if m is not None:
+        parser_stats.increment_datetime_format('<time only>')
+        return
+
+    m = year_qtr.match(x)
+    if m is not None and int(m.group(1)) == out.year and m.group(2) in '1234':
+        parser_stats.increment_datetime_format('yyyyQq')
+        return
+
+    raise ValueError(x, out)
+
+
 def parse_datetime_string(object date_string, object freq=None,
                           dayfirst=False, yearfirst=False, **kwargs):
 
@@ -1748,6 +2080,7 @@ def parse_datetime_string(object date_string, object freq=None,
 
     dt = parse_date(date_string, default=_DEFAULT_DATETIME,
                     dayfirst=dayfirst, yearfirst=yearfirst, **kwargs)
+    collect_date_parser_stats(date_string, dt, kwargs.get('parser_stats'))
     return dt
 
 
@@ -2134,7 +2467,7 @@ cpdef array_with_unit_to_datetime(ndarray values, unit, errors='coerce'):
 cpdef array_to_datetime(ndarray[object] values, errors='raise',
                         dayfirst=False, yearfirst=False, freq=None,
                         format=None, utc=None,
-                        require_iso8601=False):
+                        require_iso8601=False, parser_stats=None):
     cdef:
         Py_ssize_t i, n = len(values)
         object val, py_dt
@@ -2231,6 +2564,7 @@ cpdef array_to_datetime(ndarray[object] values, errors='raise',
                     if out_local == 1:
                         tz = pytz.FixedOffset(out_tzoffset)
                         value = tz_convert_single(value, tz, 'UTC')
+                    collect_date_parser_stats(val, value, parser_stats)
                     iresult[i] = value
                     _check_dts_bounds(&dts)
                 except ValueError:
@@ -2247,7 +2581,7 @@ cpdef array_to_datetime(ndarray[object] values, errors='raise',
 
                     try:
                         py_dt = parse_datetime_string(val, dayfirst=dayfirst,
-                                                      yearfirst=yearfirst, freq=freq)
+                                                      yearfirst=yearfirst, freq=freq, parser_stats=parser_stats)
                     except Exception:
                         if is_coerce:
                             iresult[i] = NPY_NAT
@@ -2312,7 +2646,7 @@ cpdef array_to_datetime(ndarray[object] values, errors='raise',
 
                 try:
                     oresult[i] = parse_datetime_string(val, dayfirst=dayfirst,
-                                                    yearfirst=yearfirst, freq=freq)
+                                                       yearfirst=yearfirst, freq=freq, parser_stats=parser_stats)
                     _pydatetime_to_dts(oresult[i], &dts)
                     _check_dts_bounds(&dts)
                 except Exception:
@@ -2328,7 +2662,7 @@ cpdef array_to_datetime(ndarray[object] values, errors='raise',
         return oresult
 
 def parse_str_array_to_datetime(ndarray values, dayfirst=False,
-                                yearfirst=False, object freq=None):
+                                yearfirst=False, object freq=None, parser_stats=None):
     """Shortcut to parse str array for quicker DatetimeIndex construction"""
     cdef:
         Py_ssize_t i, n = len(values)
@@ -2342,7 +2676,7 @@ def parse_str_array_to_datetime(ndarray values, dayfirst=False,
         val = values[i]
         try:
             py_dt = parse_datetime_string(val, dayfirst=dayfirst,
-                                          yearfirst=yearfirst, freq=freq)
+                                          yearfirst=yearfirst, freq=freq, parser_stats=parser_stats)
         except Exception:
             raise ValueError
         _ts = convert_to_tsobject(py_dt, None, None, 0, 0)
@@ -2953,7 +3287,7 @@ cdef dict timedelta_abbrevs = { 'D' : 'd',
                                 'min' : 'm',
                                 'minutes' : 'm',
                                 's' : 's',
-                                'seconds' : 's',
+                                'seconds' : 's', 
                                 'sec' : 's',
                                 'second' : 's',
                                 'ms' : 'ms',

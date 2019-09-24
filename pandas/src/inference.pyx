@@ -1,6 +1,6 @@
 import sys
 cimport util
-from tslib import NaT, get_timezone
+from tslib import NaT, get_timezone, collect_date_parser_stats
 from datetime import datetime, timedelta
 iNaT = util.get_nat()
 
@@ -795,7 +795,7 @@ def convert_sql_column(x):
     return maybe_convert_objects(x, try_float=1)
 
 def try_parse_dates(ndarray[object] values, parser=None,
-                    dayfirst=False,default=None):
+                    dayfirst=False,default=None, parser_stats=None):
     cdef:
         Py_ssize_t i, n
         ndarray[object] result
@@ -810,13 +810,21 @@ def try_parse_dates(ndarray[object] values, parser=None,
 
         try:
             from dateutil.parser import parse
-            parse_date = lambda x: parse(x, dayfirst=dayfirst,default=default)
+
+            def parse_date(x):
+                out = parse(x, dayfirst=dayfirst,default=default)
+                collect_date_parser_stats(x, out, parser_stats)
+                return out
         except ImportError: # pragma: no cover
             def parse_date(s):
                 try:
-                    return datetime.strptime(s, '%m/%d/%Y')
+                    out = datetime.strptime(s, '%m/%d/%Y')
                 except Exception:
                     return s
+                if parser_stats is not None:
+                    parser_stats.increment_datetime_format('m/d/y')
+                return out
+
         # EAFP here
         try:
             for i from 0 <= i < n:
@@ -835,7 +843,8 @@ def try_parse_dates(ndarray[object] values, parser=None,
                 if values[i] == '':
                     result[i] = np.nan
                 else:
-                    result[i] = parse_date(values[i])
+                    val = values[i]
+                    result[i] = parse_date(val, parser_stats=parser_stats)
         except Exception:
             # raise if passed parser and it failed
             raise

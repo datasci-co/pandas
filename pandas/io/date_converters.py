@@ -29,13 +29,13 @@ def parse_all_fields(year_col, month_col, day_col, hour_col, minute_col,
                                              hour_col, minute_col, second_col)
 
 
-def generic_parser(parse_func, *cols):
+def generic_parser(parse_func, *cols, parser_stats=None):
     N = _check_columns(cols)
     results = np.empty(N, dtype=object)
 
     for i in range(N):
         args = [c[i] for c in cols]
-        results[i] = parse_func(*args)
+        results[i] = parse_func(*args, parser_stats=parser_stats)
 
     return results
 

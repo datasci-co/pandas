@@ -367,7 +367,8 @@ _parser_defaults = {
     'mangle_dupe_cols': True,
     'tupleize_cols': False,
     'infer_datetime_format': False,
-    'skip_blank_lines': True
+    'skip_blank_lines': True,
+    'column_name_cleanup': None,
 }
 
 
@@ -484,7 +485,8 @@ def _make_parser_function(name, sep=','):
                  low_memory=_c_parser_defaults['low_memory'],
                  buffer_lines=None,
                  memory_map=False,
-                 float_precision=None):
+                 float_precision=None,
+                 column_name_cleanup=None):
 
         # Alias sep -> delimiter.
         if delimiter is None:
@@ -557,7 +559,9 @@ def _make_parser_function(name, sep=','):
                     mangle_dupe_cols=mangle_dupe_cols,
                     tupleize_cols=tupleize_cols,
                     infer_datetime_format=infer_datetime_format,
-                    skip_blank_lines=skip_blank_lines)
+                    skip_blank_lines=skip_blank_lines,
+
+                    column_name_cleanup=column_name_cleanup)
 
         return _read(filepath_or_buffer, kwds)
 
@@ -695,6 +699,13 @@ class TextFileReader(BaseIterator):
                 fallback_reason = "the 'c' engine does not support"\
                                   " skip_footer"
                 engine = 'python'
+                parse_dates = options.get('parse_dates', [])
+                try:
+                    parse_dates = set(parse_dates)
+                except:
+                    pass
+                else:
+                    result['parse_dates'] = parse_dates
 
         if sep is None and not delim_whitespace:
             if engine == 'c':
@@ -813,22 +824,7 @@ class TextFileReader(BaseIterator):
                 raise ValueError('skip_footer not supported for iteration')
 
         ret = self._engine.read(nrows)
-
-        if self.options.get('as_recarray'):
-            return ret
-
-        # May alter columns / col_dict
-        index, columns, col_dict = self._create_index(ret)
-
-        df = DataFrame(col_dict, columns=columns, index=index)
-
-        if self.squeeze and len(df.columns) == 1:
-            return df[df.columns[0]].copy()
-        return df
-
-    def _create_index(self, ret):
-        index, columns, col_dict = ret
-        return index, columns, col_dict
+        return ret
 
     def get_chunk(self, size=None):
         if size is None:
@@ -934,6 +930,8 @@ class ParserBase(object):
         self._name_processed = False
 
         self._first_chunk = True
+
+        self._column_name_cleanup = kwds.get('column_name_cleanup') or (lambda name: name)
 
     def close(self):
         self._reader.close()
@@ -1179,12 +1177,13 @@ class ParserBase(object):
 
         return result, na_count
 
-    def _do_date_conversions(self, names, data):
+    def _do_date_conversions(self, names, data, parser_stats):
         # returns data, columns
         if self.parse_dates is not None:
             data, names = _process_date_conversion(
                 data, self._date_conv, self.parse_dates, self.index_col,
-                self.index_names, names, keep_date_col=self.keep_date_col)
+                self.index_names, names, keep_date_col=self.keep_date_col,
+                parser_stats=parser_stats)
 
         return names, data
 
@@ -1209,7 +1208,7 @@ class CParserWrapper(ParserBase):
 
         # #2442
         kwds['allow_leading_cols'] = self.index_col is not False
-
+        kwds['parse_dates'] = self.parse_dates
         self._reader = _parser.TextReader(src, **kwds)
 
         # XXX
@@ -1229,7 +1228,7 @@ class CParserWrapper(ParserBase):
                     )
                 )
             else:
-                self.names = list(self._reader.header[0])
+                self.names = list(map(self._column_name_cleanup, self._reader.header[0]))
 
         if self.names is None:
             if self.prefix:
@@ -1311,8 +1310,9 @@ class CParserWrapper(ParserBase):
 
     def read(self, nrows=None):
         try:
-            data = self._reader.read(nrows)
+            parser_stats, data = self._reader.read(nrows)
         except StopIteration:
+            raise
             if self._first_chunk:
                 self._first_chunk = False
 
@@ -1334,62 +1334,18 @@ class CParserWrapper(ParserBase):
         # Done with first read, next time raise StopIteration
         self._first_chunk = False
 
-        if self.as_recarray:
-            # what to do if there are leading columns?
-            return data
+        # rename dict keys
+        data = sorted(data.items())
 
-        names = self.names
+        # ugh, mutation
+        names = list(self.orig_names)
+        if self.usecols is not None:
+            names = self._filter_usecols(names)
 
-        if self._reader.leading_cols:
-            if self._has_complex_date_col:
-                raise NotImplementedError('file structure not yet supported')
+        data = dict(data)
+        self._do_date_conversions(names, data, parser_stats)
 
-            # implicit index, no index names
-            arrays = []
-
-            for i in range(self._reader.leading_cols):
-                if self.index_col is None:
-                    values = data.pop(i)
-                else:
-                    values = data.pop(self.index_col[i])
-
-                values = self._maybe_parse_dates(values, i,
-                                                 try_parse_dates=True)
-                arrays.append(values)
-
-            index = MultiIndex.from_arrays(arrays)
-
-            if self.usecols is not None:
-                names = self._filter_usecols(names)
-
-            # rename dict keys
-            data = sorted(data.items())
-            data = dict((k, v) for k, (i, v) in zip(names, data))
-
-            names, data = self._do_date_conversions(names, data)
-
-        else:
-            # rename dict keys
-            data = sorted(data.items())
-
-            # ugh, mutation
-            names = list(self.orig_names)
-
-            if self.usecols is not None:
-                names = self._filter_usecols(names)
-
-            # columns as list
-            alldata = [x[1] for x in data]
-
-            data = dict((k, v) for k, (i, v) in zip(names, data))
-
-            names, data = self._do_date_conversions(names, data)
-            index, names = self._make_index(data, alldata, names)
-
-        # maybe create a mi on the columns
-        names = self._maybe_make_multi_index_columns(names, self.col_names)
-
-        return index, names, data
+        return parser_stats
 
     def _filter_usecols(self, names):
         # hackish
@@ -2254,7 +2210,7 @@ class PythonParser(ParserBase):
 
 def _make_date_converter(date_parser=None, dayfirst=False,
                          infer_datetime_format=False):
-    def converter(*date_cols):
+    def converter(*date_cols, parser_stats):
         if date_parser is None:
             strs = _concat_date_cols(date_cols)
 
@@ -2265,15 +2221,17 @@ def _make_date_converter(date_parser=None, dayfirst=False,
                     box=False,
                     dayfirst=dayfirst,
                     errors='ignore',
-                    infer_datetime_format=infer_datetime_format
+                    infer_datetime_format=infer_datetime_format,
+                    parser_stats=parser_stats,
                 )
             except:
                 return tools.to_datetime(
-                    lib.try_parse_dates(strs, dayfirst=dayfirst))
+                    lib.try_parse_dates(strs, dayfirst=dayfirst, parser_stats=parser_stats),
+                    parser_stats=parser_stats)
         else:
             try:
                 result = tools.to_datetime(
-                    date_parser(*date_cols), errors='ignore')
+                    date_parser(*date_cols, parser_stats=parser_stats), errors='ignore', parser_stats=parser_stats)
                 if isinstance(result, datetime.datetime):
                     raise Exception('scalar parser')
                 return result
@@ -2282,17 +2240,20 @@ def _make_date_converter(date_parser=None, dayfirst=False,
                     return tools.to_datetime(
                         lib.try_parse_dates(_concat_date_cols(date_cols),
                                             parser=date_parser,
-                                            dayfirst=dayfirst),
+                                            dayfirst=dayfirst,
+                                            parser_stats=parser_stats),
+                        parser_stats=parser_stats,
                         errors='ignore')
                 except Exception:
-                    return generic_parser(date_parser, *date_cols)
+                    return generic_parser(date_parser, *date_cols, parser_stats=parser_stats)
 
     return converter
 
 
 def _process_date_conversion(data_dict, converter, parse_spec,
                              index_col, index_names, columns,
-                             keep_date_col=False):
+                             keep_date_col=False,
+                             parser_stats=None):
     def _isindex(colspec):
         return ((isinstance(index_col, list) and
                  colspec in index_col) or
@@ -2318,10 +2279,13 @@ def _process_date_conversion(data_dict, converter, parse_spec,
                     colspec = orig_names[colspec]
                 if _isindex(colspec):
                     continue
-                data_dict[colspec] = converter(data_dict[colspec])
+                data_dict[colspec] = converter(
+                    data_dict[colspec],
+                    parser_stats=parser_stats,
+                )
             else:
                 new_name, col, old_names = _try_convert_dates(
-                    converter, colspec, data_dict, orig_names)
+                    converter, colspec, data_dict, orig_names, parser_stats)
                 if new_name in data_dict:
                     raise ValueError('New date column already in dict %s' %
                                      new_name)
@@ -2354,7 +2318,7 @@ def _process_date_conversion(data_dict, converter, parse_spec,
     return data_dict, new_cols
 
 
-def _try_convert_dates(parser, colspec, data_dict, columns):
+def _try_convert_dates(parser, colspec, data_dict, columns, parser_stats):
     colset = set(columns)
     colnames = []
 
@@ -2369,7 +2333,7 @@ def _try_convert_dates(parser, colspec, data_dict, columns):
     new_name = '_'.join([str(x) for x in colnames])
     to_parse = [data_dict[c] for c in colnames if c in data_dict]
 
-    new_col = parser(*to_parse)
+    new_col = parser(*to_parse, parser_stats=parser_stats)
     return new_name, new_col, colnames
 
 

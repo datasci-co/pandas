@@ -170,7 +170,7 @@ def _guess_datetime_format_for_array(arr, **kwargs):
                  mapping={True: 'coerce', False: 'raise'})
 def to_datetime(arg, errors='raise', dayfirst=False, yearfirst=False,
                 utc=None, box=True, format=None, exact=True, coerce=None,
-                unit=None, infer_datetime_format=False):
+                unit=None, infer_datetime_format=False, parser_stats=None):
     """
     Convert argument to datetime.
 
@@ -288,12 +288,13 @@ def to_datetime(arg, errors='raise', dayfirst=False, yearfirst=False,
     return _to_datetime(arg, errors=errors, dayfirst=dayfirst,
                         yearfirst=yearfirst,
                         utc=utc, box=box, format=format, exact=exact,
-                        unit=unit, infer_datetime_format=infer_datetime_format)
+                        unit=unit, infer_datetime_format=infer_datetime_format, parser_stats=parser_stats)
 
 
 def _to_datetime(arg, errors='raise', dayfirst=False, yearfirst=False,
                  utc=None, box=True, format=None, exact=True,
-                 unit=None, freq=None, infer_datetime_format=False):
+                 unit=None, freq=None, infer_datetime_format=False,
+                 parser_stats=None):
     """
     Same as to_datetime, but accept freq for
     DatetimeIndex internal construction
@@ -301,7 +302,6 @@ def _to_datetime(arg, errors='raise', dayfirst=False, yearfirst=False,
     from pandas.tseries.index import DatetimeIndex
 
     def _convert_listlike(arg, box, format, name=None):
-
         if isinstance(arg, (list, tuple)):
             arg = np.array(arg, dtype='O')
 
@@ -395,7 +395,8 @@ def _to_datetime(arg, errors='raise', dayfirst=False, yearfirst=False,
                     dayfirst=dayfirst,
                     yearfirst=yearfirst,
                     freq=freq,
-                    require_iso8601=require_iso8601
+                    require_iso8601=require_iso8601,
+                    parser_stats=parser_stats,
                 )
 
             if com.is_datetime64_dtype(result) and box:

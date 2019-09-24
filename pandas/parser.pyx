@@ -1,15 +1,17 @@
 # Copyright (c) 2012, Lambda Foundry, Inc.
 # See LICENSE for the license
 
-from libc.stdio cimport fopen, fclose
-from libc.stdlib cimport malloc, free
-from libc.string cimport strncpy, strlen, strcmp, strcasecmp
+from libc.stdio cimport fopen, fclose, printf
+from libc.stdlib cimport malloc, free, realloc, qsort
+from libc.string cimport strncpy, strlen, strcmp, strcasecmp, strdup
 cimport libc.stdio as stdio
 import warnings
 
+from pandas.tslib import condense_formats
+
 from cpython cimport (PyObject, PyBytes_FromString,
                       PyBytes_AsString, PyBytes_Check,
-                      PyUnicode_Check, PyUnicode_AsUTF8String)
+                      PyUnicode_Check, PyUnicode_AsUTF8String, PyBytes_FromStringAndSize)
 from io.common import CParserError, DtypeWarning, EmptyDataError
 
 
@@ -247,6 +249,481 @@ _NA_VALUES = [b'-1.#IND', b'1.#QNAN', b'1.#IND', b'-1.#QNAN',
               b'nan', b'']
 
 
+cdef inline void cleanup_owning_kh_str(kh_str_t* h) nogil:
+    if not h:
+        return
+    cdef khint_t it = 0
+    while it != h.n_buckets:
+        if kh_exist_str(h, it):
+            free(h.keys[it])
+        it += 1
+    kh_destroy_str(h)
+
+
+cdef struct sized_string:
+    char* data
+    size_t size
+
+
+cdef int sized_string_cmp(const void* a, const void* b) nogil:
+    return strcmp((<sized_string*> a).data, (<sized_string*> b).data);
+
+
+cdef class ParserStats:
+    cdef:
+        kh_str_t *_na_format_counter
+        kh_str_t *_na_format_counter_datasets
+        kh_str_t *_datetime_format_counter
+        kh_str_t *_datetime_format_counter_datasets
+        kh_str_t *_bool_true_format_counter
+        kh_str_t *_bool_false_format_counter
+
+        kh_str_t *_mixed_na_format_counter_datasets
+        kh_str_t *_mixed_datetime_format_counter_datasets
+
+    def __cinit__(self):
+        self._na_format_counter = kh_init_str()
+        self._na_format_counter_datasets = kh_init_str()
+
+        self._datetime_format_counter = kh_init_str()
+        self._datetime_format_counter_datasets = kh_init_str()
+
+        self._bool_true_format_counter = kh_init_str()
+        self._bool_false_format_counter = kh_init_str()
+
+        self._mixed_datetime_format_counter_datasets = kh_init_str()
+        self._mixed_na_format_counter_datasets = kh_init_str()
+
+    @staticmethod
+    cdef _add_mixed_format_counter_datasets(kh_str_t *mixed, kh_str_t *single):
+        cdef char *data
+        cdef size_t size
+        cdef char *new_fmt
+        cdef khint_t ix
+        cdef size_t kix = 0
+        cdef size_t new_key_size = 0
+        cdef sized_string *keys
+
+        if single.size <= 1:
+            return
+
+        keys = <sized_string*> malloc(sizeof(sized_string) * single.size)
+
+        for ix from 0 <= ix < single.n_buckets:
+            if kh_exist_str(single, ix):
+                data = single.keys[ix]
+                size = strlen(data)
+                keys[kix].data = data
+                keys[kix].size = size
+                new_key_size += size + 1
+                kix += 1
+
+        qsort(
+            keys,
+            single.size,
+            sizeof(sized_string),
+            sized_string_cmp,
+        )
+        new_fmt = <char*> malloc(new_key_size)
+        memcpy(new_fmt, keys[0].data, keys[0].size)
+        ix = keys[0].size
+        for kix from 1 <= kix < single.size:
+            new_fmt[ix] = ';'
+            ix += 1
+            memcpy(new_fmt + ix, keys[kix].data, keys[kix].size)
+            ix += keys[kix].size
+            new_fmt[ix] = '\0'
+        free(keys)
+        increment_counter_val(mixed, new_fmt)
+        free(new_fmt)
+
+    def finalize_parse(self):
+        cdef list datetime_formats = []
+        cdef size_t canonical_count = 0
+        cdef char *false_str = NULL
+        cdef char *true_str = NULL
+        cdef char *new_fmt
+        cdef khint_t ix
+
+        for ix from 0 <= ix < self._datetime_format_counter.n_buckets:
+            if kh_exist_str(self._datetime_format_counter, ix):
+                datetime_formats.append(self._datetime_format_counter.keys[ix])
+                canonical_count += self._datetime_format_counter.vals[ix]
+
+        canonical_format = condense_formats(datetime_formats)
+        if canonical_format is not None:
+            cleanup_owning_kh_str(self._datetime_format_counter)
+            self._datetime_format_counter = kh_init_str()
+            increment_counter_val(
+                self._datetime_format_counter,
+                PyBytes_AsString(canonical_format),
+                canonical_count,
+            )
+
+        for ix from 0 <= ix < self._datetime_format_counter.n_buckets:
+            if kh_exist_str(self._datetime_format_counter, ix):
+                increment_counter_val(
+                    self._datetime_format_counter_datasets,
+                    self._datetime_format_counter.keys[ix],
+                )
+        ParserStats._add_mixed_format_counter_datasets(
+            self._mixed_datetime_format_counter_datasets,
+            self._datetime_format_counter,
+        )
+
+        for ix from 0 <= ix < self._na_format_counter.n_buckets:
+            if kh_exist_str(self._na_format_counter, ix):
+                increment_counter_val(
+                    self._na_format_counter_datasets,
+                    self._na_format_counter.keys[ix],
+                )
+        ParserStats._add_mixed_format_counter_datasets(
+            self._mixed_na_format_counter_datasets,
+            self._na_format_counter,
+        )
+
+    def __dealloc__(self):
+        cleanup_owning_kh_str(self._na_format_counter)
+        cleanup_owning_kh_str(self._na_format_counter_datasets)
+        cleanup_owning_kh_str(self._datetime_format_counter)
+        cleanup_owning_kh_str(self._datetime_format_counter_datasets)
+        cleanup_owning_kh_str(self._bool_true_format_counter)
+        cleanup_owning_kh_str(self._bool_false_format_counter)
+        cleanup_owning_kh_str(self._mixed_na_format_counter_datasets)
+        cleanup_owning_kh_str(self._mixed_datetime_format_counter_datasets)
+
+    @staticmethod
+    cdef _steal_kh_str(kh_str_t **new_, kh_str_t** old):
+        if old:
+            new_[0], old[0] = old[0], new_[0]
+
+    @staticmethod
+    cdef steal(kh_str_t **na_format_counter,
+               kh_str_t **datetime_format_counter,
+               kh_str_t **bool_true_format_counter,
+               kh_str_t **bool_false_format_counter):
+        cdef ParserStats self = ParserStats()
+        ParserStats._steal_kh_str(&self._na_format_counter, na_format_counter)
+        ParserStats._steal_kh_str(
+            &self._datetime_format_counter,
+            datetime_format_counter,
+        )
+        ParserStats._steal_kh_str(
+            &self._bool_true_format_counter,
+            bool_true_format_counter,
+        )
+        ParserStats._steal_kh_str(
+            &self._bool_false_format_counter,
+            bool_false_format_counter,
+        )
+        return self
+
+    @staticmethod
+    cdef _merge_owning_kh_str(kh_str_t *lhs, kh_str_t *rhs):
+        cdef int rc
+        cdef khint_t it = 0
+        cdef khint_t lhs_ix
+        while it != rhs.n_buckets:
+            if kh_exist_str(rhs, it):
+                increment_counter_val(lhs, rhs.keys[it], rhs.vals[it])
+            it += 1
+
+    cpdef merge_inplace(self, ParserStats other):
+        """Merge two parser stats into a single stats object.
+
+        Parameters
+        ----------
+        other : ParserStats
+            The parser stats to merge into ``self``.
+
+        Notes
+        -----
+        This mutates ``self`` in place.
+        """
+        ParserStats._merge_owning_kh_str(
+            self._na_format_counter,
+            other._na_format_counter,
+        )
+        ParserStats._merge_owning_kh_str(
+            self._na_format_counter_datasets,
+            other._na_format_counter_datasets,
+        )
+
+        ParserStats._merge_owning_kh_str(
+            self._datetime_format_counter,
+            other._datetime_format_counter,
+        )
+        ParserStats._merge_owning_kh_str(
+            self._datetime_format_counter_datasets,
+            other._datetime_format_counter_datasets,
+        )
+
+        ParserStats._merge_owning_kh_str(
+            self._bool_true_format_counter,
+            other._bool_true_format_counter,
+        )
+        ParserStats._merge_owning_kh_str(
+            self._bool_false_format_counter,
+            other._bool_false_format_counter,
+        )
+
+        ParserStats._merge_owning_kh_str(
+            self._mixed_datetime_format_counter_datasets,
+            other._mixed_datetime_format_counter_datasets,
+        )
+        ParserStats._merge_owning_kh_str(
+            self._mixed_na_format_counter_datasets,
+            other._mixed_na_format_counter_datasets,
+        )
+
+    @staticmethod
+    cdef inline _kh_str_to_dict(kh_str_t *h):
+        cdef dict out = {}
+        cdef khint_t it = 0
+        while it != h.n_buckets:
+            if kh_exist_str(h, it):
+                out[h.keys[it]] = h.vals[it]
+            it += 1
+        return out
+
+    def na_format_counter(self):
+        return ParserStats._kh_str_to_dict(self._na_format_counter)
+
+    def na_format_counter_datasets(self):
+        return ParserStats._kh_str_to_dict(self._na_format_counter_datasets)
+
+    def datetime_format_counter(self):
+        return ParserStats._kh_str_to_dict(self._datetime_format_counter)
+
+    def datetime_format_counter_datasets(self):
+        return ParserStats._kh_str_to_dict(
+            self._datetime_format_counter_datasets,
+        )
+
+    def bool_true_format_counter(self):
+        return ParserStats._kh_str_to_dict(self._bool_true_format_counter)
+
+    def bool_false_format_counter(self):
+        return ParserStats._kh_str_to_dict(self._bool_false_format_counter)
+
+    def mixed_datetime_format_counter_datasets(self):
+        return ParserStats._kh_str_to_dict(
+            self._mixed_datetime_format_counter_datasets,
+        )
+
+    def mixed_na_format_counter_datasets(self):
+        return ParserStats._kh_str_to_dict(
+            self._mixed_na_format_counter_datasets,
+        )
+
+    def increment_datetime_format(self, str fmt, size_t count=1):
+        """Increment the counter for the datetime format ``fmt``.
+        """
+        increment_counter_val(
+            self._datetime_format_counter,
+            PyUnicode_AsUTF8String(fmt),
+            count,
+        )
+
+    @staticmethod
+    cdef _serialize_kh_str(BufferedWriter out, kh_str_t* h):
+        cdef const char* key
+        cdef size_t size
+        cdef khint_t it = 0
+
+        out.write(<const char*> &h.size, sizeof(h.size))
+        while it != h.n_buckets:
+            if kh_exist_str(h, it):
+                key = h.keys[it]
+                size = strlen(key)
+                out.write(<const char*> &size, sizeof(size))
+                out.write(key, size)
+                out.write(<const char*> &h.vals[it], sizeof(h.vals[it]))
+            it += 1
+
+    @staticmethod
+    cdef char* _deserialize_kh_str(kh_str_t* out, const char* cursor, const char* end) except NULL:
+        cdef int ret
+        cdef khint_t hix
+        cdef size_t ix
+        cdef khint_t hash_size
+        cdef size_t size
+        cdef char* key
+
+        if end - cursor < sizeof(hash_size):
+            raise ValueError('missing kh_str_t size')
+
+        memcpy(&hash_size, cursor, sizeof(hash_size))
+        cursor += sizeof(hash_size)
+        for ix from 0 <= ix < hash_size:
+            if end - cursor < sizeof(size):
+                raise ValueError('missing key size for element %d' % ix)
+            memcpy(<char*> &size, cursor, sizeof(size))
+            cursor += sizeof(size)
+
+            if end - cursor < size:
+                raise ValueError('missing key for element %d' % ix)
+            key = <char*> malloc(size + 1)  # plus '\0'
+            memcpy(key, cursor, size)
+            key[size] = 0
+            cursor += size
+
+            if end - cursor < sizeof(size):
+                free(key)
+                raise ValueError('missing value for element %d' % ix)
+            memcpy(<char*> &size, cursor, sizeof(size))
+            cursor += sizeof(size)
+
+            hix = kh_put_str(out, key, &ret)
+            if ret != 1:
+                free(key)
+                raise ValueError('duplicate key: %s' % key)
+            out.vals[hix] = size
+
+        return cursor
+
+    def serialize(self):
+        cdef BufferedWriter buf = BufferedWriter()
+
+        ParserStats._serialize_kh_str(buf, self._na_format_counter)
+        ParserStats._serialize_kh_str(buf, self._na_format_counter_datasets)
+
+        ParserStats._serialize_kh_str(buf, self._datetime_format_counter)
+        ParserStats._serialize_kh_str(buf, self._datetime_format_counter_datasets)
+
+        ParserStats._serialize_kh_str(buf, self._bool_true_format_counter)
+        ParserStats._serialize_kh_str(buf, self._bool_false_format_counter)
+
+        ParserStats._serialize_kh_str(buf, self._mixed_na_format_counter_datasets)
+        ParserStats._serialize_kh_str(buf, self._mixed_datetime_format_counter_datasets)
+
+        return buf.flatten()
+
+    @staticmethod
+    def deserialize(bytes data):
+        cdef ParserStats self = ParserStats()
+        cdef char* cursor = data
+        cdef char* end = cursor + len(data)
+
+        cursor = ParserStats._deserialize_kh_str(self._na_format_counter, cursor, end)
+        cursor = ParserStats._deserialize_kh_str(self._na_format_counter_datasets, cursor, end)
+
+        cursor = ParserStats._deserialize_kh_str(self._datetime_format_counter, cursor, end)
+        cursor = ParserStats._deserialize_kh_str(self._datetime_format_counter_datasets, cursor, end)
+
+        cursor = ParserStats._deserialize_kh_str(self._bool_true_format_counter, cursor, end)
+        cursor = ParserStats._deserialize_kh_str(self._bool_false_format_counter, cursor, end)
+
+        cursor = ParserStats._deserialize_kh_str(self._mixed_na_format_counter_datasets, cursor, end)
+        cursor = ParserStats._deserialize_kh_str(self._mixed_datetime_format_counter_datasets, cursor, end)
+
+        if cursor != end:
+            raise ValueError('extra %d bytes in buffer' % (end - cursor))
+
+        return self
+
+    def __reduce__(self):
+        return (_pydeserialize, (self.serialize(),))
+
+    @staticmethod
+    def _format_counter_dict(d):
+        items = sorted(d.items(), key=lambda kv: kv[1], reverse=True)
+        try:
+            size = max(len(repr(k.decode())) for k in d.keys())
+        except ValueError:
+            return
+
+        for k, v in items:
+            yield '  {k:>{size}}: {v:>8}'.format(k=repr(k.decode()), v=v, size=size)
+
+    def summary(self):
+        lines = []
+
+        lines.append('na_format_counter:')
+        lines.extend(ParserStats._format_counter_dict(self.na_format_counter()))
+
+        lines.append('na_format_counter_datasets:')
+        lines.extend(ParserStats._format_counter_dict(self.na_format_counter_datasets()))
+
+        lines.append('mixed_na_format_counter_datasets:')
+        lines.extend(ParserStats._format_counter_dict(
+            self.mixed_na_format_counter_datasets(),
+        ))
+
+        lines.append('datetime_format_counter:')
+        lines.extend(ParserStats._format_counter_dict(
+            self.datetime_format_counter(),
+        ))
+
+        lines.append('datetime_format_counter_datasets:')
+        lines.extend(ParserStats._format_counter_dict(
+            self.datetime_format_counter_datasets(),
+        ))
+
+        lines.append('mixed_datetime_format_counter_datasets:')
+        lines.extend(ParserStats._format_counter_dict(
+            self.mixed_datetime_format_counter_datasets(),
+        ))
+
+        lines.append('bool_true_format_counter:')
+        lines.extend(ParserStats._format_counter_dict(
+            self.bool_true_format_counter(),
+        ))
+
+        lines.append('bool_false_format_counter:')
+        lines.extend(ParserStats._format_counter_dict(
+            self.bool_false_format_counter(),
+        ))
+
+        return '\n'.join(lines)
+
+
+def _pydeserialize(data):
+    return ParserStats.deserialize(data)
+
+
+cdef class BufferedWriter:
+    cdef bytes active_data
+    cdef size_t active_size
+    cdef list components
+    cdef size_t committed_total_size
+
+    def __cinit__(self, size_t buffer_size = 4096):
+        self.active_data = b'\0' * buffer_size
+        self.active_size = 0
+        self.components = []
+
+    cdef _commit(self):
+        self.components.append(self.active_data)
+        self.committed_total_size += self.active_size
+
+        self.active_data = b'\0' * len(self.active_data)
+        self.active_size = 0
+
+    cdef size_t _remaining_active_space(self):
+        return len(self.active_data) - self.active_size
+
+    cdef write(self, const char* data, size_t size):
+        cdef size_t remaining_active_space = self._remaining_active_space()
+
+        while size > remaining_active_space:
+            memcpy(
+                PyBytes_AsString(self.active_data) + self.active_size,
+                data,
+                remaining_active_space,
+            )
+            self._commit()
+            data += remaining_active_space
+            size -= remaining_active_space
+            remaining_active_space = self._remaining_active_space()
+
+        memcpy(PyBytes_AsString(self.active_data) + self.active_size, data, size)
+        self.active_size += size
+
+    cdef bytes flatten(self):
+        return b''.join(self.components + [self.active_data[:self.active_size]])
+
+
 cdef class TextReader:
     """
 
@@ -265,6 +742,14 @@ cdef class TextReader:
         char *c_encoding
         kh_str_t *false_set
         kh_str_t *true_set
+
+        frozenset _parse_dates
+        object _column_name_cleanup
+        # counters
+        kh_str_t *_na_value_counter
+        kh_str_t *_datetime_format_counter
+        kh_str_t *_bool_true_format_counter
+        kh_str_t *_bool_false_format_counter
 
     cdef public:
         int leading_cols, table_width, skip_footer, buffer_lines
@@ -339,7 +824,11 @@ cdef class TextReader:
                   mangle_dupe_cols=True,
                   tupleize_cols=False,
                   float_precision=None,
-                  skip_blank_lines=True):
+                  skip_blank_lines=True,
+
+                  parse_dates=None,
+
+                  column_name_cleanup=None):
 
         self.parser = parser_new()
         self.parser.chunksize = tokenize_chunksize
@@ -528,6 +1017,17 @@ cdef class TextReader:
         while self.buffer_lines * 2< heuristic:
             self.buffer_lines *= 2
 
+        self._parse_dates = frozenset(parse_dates) if parse_dates else frozenset()
+        self._column_name_cleanup = column_name_cleanup or (lambda name: name)
+        if column_name_cleanup is not None:
+            self._parse_dates = frozenset(
+                column_name_cleanup(k) for k in self._parse_dates
+            )
+        self._na_value_counter = kh_init_str()
+        self._datetime_format_counter = kh_init_str()
+        self._bool_true_format_counter = kh_init_str()
+        self._bool_false_format_counter = kh_init_str()
+
     def __init__(self, *args, **kwards):
         pass
 
@@ -535,6 +1035,11 @@ cdef class TextReader:
         parser_free(self.parser)
         kh_destroy_str(self.true_set)
         kh_destroy_str(self.false_set)
+
+        cleanup_owning_kh_str(self._na_value_counter)
+        cleanup_owning_kh_str(self._datetime_format_counter)
+        cleanup_owning_kh_str(self._bool_true_format_counter)
+        cleanup_owning_kh_str(self._bool_false_format_counter)
 
     def close(self):
         # we need to properly close an open derived
@@ -793,6 +1298,15 @@ cdef class TextReader:
     cdef _implicit_index_count(self):
         pass
 
+    cdef inline _move_to_stats_object(self):
+        cdef ParserStats stats = ParserStats.steal(
+            &self._na_value_counter,
+            &self._datetime_format_counter,
+            &self._bool_true_format_counter,
+            &self._bool_false_format_counter,
+        )
+        return stats
+
     def read(self, rows=None):
         """
         rows=None --> read all rows
@@ -807,14 +1321,7 @@ cdef class TextReader:
             # Don't care about memory usage
             columns = self._read_rows(rows, 1)
 
-        if self.as_recarray:
-            self._start_clock()
-            result = _to_structured_array(columns, self.header)
-            self._end_clock('Conversion to structured array')
-
-            return result
-        else:
-            return columns
+        return self._move_to_stats_object(), columns
 
     cdef _read_low_memory(self, rows):
         cdef:
@@ -849,7 +1356,7 @@ cdef class TextReader:
         parser_trim_buffers(self.parser)
 
         if len(chunks) == 0:
-            raise StopIteration
+            return {}
 
         # destructive to chunks
         return _concatenate_chunks(chunks)
@@ -1003,27 +1510,23 @@ cdef class TextReader:
                 na_filter = 0
 
             if conv:
-                results[i] = _apply_converter(conv, self.parser, i, start, end,
-                                              self.c_encoding)
+                results[i] = np.empty(0)
                 continue
 
             # Should return as the desired dtype (inferred or specified)
-            col_res, na_count = self._convert_tokens(i, start, end, name,
-                                                     na_filter, na_hashset, na_flist)
+            res = self._convert_tokens(i, start, end, name,
+                                            na_filter, na_hashset, na_flist)
+            if isinstance(res, tuple):
+                result, na_count = res
+                name_to_use = name
+                if isinstance(name, int):
+                    name_to_use = self._column_name_cleanup(self.header[0][i])
+                results[name_to_use] = result
+            else:
+                na_count = res
 
-            if na_filter:
-                self._free_na_set(na_hashset)
-
-            if upcast_na and na_count > 0:
-                col_res = _maybe_upcast(col_res)
-
-            if issubclass(col_res.dtype.type, np.integer) and self.compact_ints:
-                col_res = downcast_int64(col_res, self.use_unsigned)
-
-            if col_res is None:
+            if na_count is None:
                 raise CParserError('Unable to parse column %d' % i)
-
-            results[i] = col_res
 
         self.parser_start += end - start
 
@@ -1055,48 +1558,36 @@ cdef class TextReader:
                     else:
                         col_dtype = np.dtype(col_dtype).str
 
-                col_res, na_count = self._convert_with_dtype(col_dtype, i, start, end,
+                na_count = self._convert_with_dtype(col_dtype, i, start, end,
                                                              na_filter, 1, na_hashset, na_flist)
 
                 # fallback on the parse (e.g. we requested int dtype, but its actually a float)
-                if col_res is not None:
-                    return col_res, na_count
+                if na_count is not None:
+                    return na_count
 
         if i in self.noconvert:
-            return self._string_convert(i, start, end, na_filter, na_hashset)
+            return self._string_convert(
+                i,
+                start,
+                end,
+                na_filter,
+                na_hashset,
+                self._column_name_cleanup(self.header[0][i]) in self._parse_dates,
+            )
         else:
             col_res = None
             for dt in dtype_cast_order:
                 try:
-                    col_res, na_count = self._convert_with_dtype(
+                    na_count = self._convert_with_dtype(
                         dt, i, start, end, na_filter, 0, na_hashset, na_flist)
                 except OverflowError:
                     col_res, na_count = self._convert_with_dtype(
                         '|O8', i, start, end, na_filter, 0, na_hashset, na_flist)
 
-                if col_res is not None:
+                if na_count is not None:
                     break
 
-        # we had a fallback parse on the dtype, so now try to cast
-        # only allow safe casts, eg. with a nan you cannot safely cast to int
-        if col_res is not None and col_dtype is not None:
-            try:
-                col_res = col_res.astype(col_dtype,casting='safe')
-            except TypeError:
-
-                # float -> int conversions can fail the above
-                # even with no nans
-                col_res_orig = col_res
-                col_res = col_res.astype(col_dtype)
-                if (col_res != col_res_orig).any():
-                    raise ValueError("cannot safely convert passed user dtype of "
-                                     "{col_dtype} for {col_res} dtyped data in "
-                                     "column {column}".format(col_dtype=col_dtype,
-                                                              col_res=col_res_orig.dtype.name,
-                                                              column=i))
-
-
-        return col_res, na_count
+        return na_count
 
     cdef _convert_with_dtype(self, object dtype, Py_ssize_t i,
                              int start, int end,
@@ -1105,31 +1596,29 @@ cdef class TextReader:
                              kh_str_t *na_hashset,
                              object na_flist):
         if dtype[1] == 'i' or dtype[1] == 'u':
-            result, na_count = _try_int64(self.parser, i, start, end,
-                                          na_filter, na_hashset)
+            na_count = _try_int64(self.parser, i, start, end,
+                                          na_filter, na_hashset, self._na_value_counter)
             if user_dtype and na_count is not None:
                 if na_count > 0:
                     raise ValueError("Integer column has NA values in "
                                     "column {column}".format(column=i))
 
-            if result is not None and dtype[1:] != 'i8':
-                result = result.astype(dtype)
-
-            return result, na_count
+            return na_count
 
         elif dtype[1] == 'f':
-            result, na_count = _try_double(self.parser, i, start, end,
-                                           na_filter, na_hashset, na_flist)
+            na_count = _try_double(self.parser, i, start, end,
+                                           na_filter, na_hashset, na_flist, self._na_value_counter)
 
-            if result is not None and dtype[1:] != 'f8':
-                result = result.astype(dtype)
-            return result, na_count
+            return na_count
 
         elif dtype[1] == 'b':
-            result, na_count = _try_bool_flex(self.parser, i, start, end,
+            na_count = _try_bool_flex(self.parser, i, start, end,
                                               na_filter, na_hashset,
-                                              self.true_set, self.false_set)
-            return result, na_count
+                                              self.true_set, self.false_set,
+                                              self._na_value_counter,
+                                              self._bool_true_format_counter,
+                                              self._bool_false_format_counter)
+            return na_count
         elif dtype[1] == 'c':
             raise NotImplementedError("the dtype %s is not supported for parsing" % dtype)
 
@@ -1137,8 +1626,8 @@ cdef class TextReader:
             # TODO: na handling
             width = int(dtype[2:])
             if width > 0:
-                result = _to_fw_string(self.parser, i, start, end, width)
-                return result, 0
+                # this doesn't handle nan, so we can skip this
+                return 0
 
             # treat as a regular string parsing
             return self._string_convert(i, start, end, na_filter,
@@ -1163,31 +1652,31 @@ cdef class TextReader:
             raise TypeError("the dtype %s is not supported for parsing" % dtype)
 
     cdef _string_convert(self, Py_ssize_t i, int start, int end,
-                         bint na_filter, kh_str_t *na_hashset):
+                         bint na_filter, kh_str_t *na_hashset, bint return_data = False):
         if PY3:
             if self.c_encoding != NULL:
                 if self.c_encoding == b"utf-8":
                     return _string_box_utf8(self.parser, i, start, end,
-                                            na_filter, na_hashset)
+                                            na_filter, na_hashset, self._na_value_counter, return_data)
                 else:
                     return _string_box_decode(self.parser, i, start, end,
                                               na_filter, na_hashset,
-                                              self.c_encoding)
+                                              self.c_encoding, self._na_value_counter, return_data)
             else:
                 return _string_box_utf8(self.parser, i, start, end,
-                                        na_filter, na_hashset)
+                                        na_filter, na_hashset, self._na_value_counter, return_data)
         else:
             if self.c_encoding != NULL:
                 if self.c_encoding == b"utf-8":
                     return _string_box_utf8(self.parser, i, start, end,
-                                            na_filter, na_hashset)
+                                            na_filter, na_hashset, self._na_value_counter, return_data)
                 else:
                     return _string_box_decode(self.parser, i, start, end,
                                               na_filter, na_hashset,
-                                              self.c_encoding)
+                                              self.c_encoding, self._na_value_counter, return_data)
             else:
                 return _string_box_factorize(self.parser, i, start, end,
-                                             na_filter, na_hashset)
+                                             na_filter, na_hashset, self._na_value_counter)
 
     def _get_converter(self, i, name):
         if self.converters is None:
@@ -1233,9 +1722,9 @@ cdef class TextReader:
     cdef _get_column_name(self, Py_ssize_t i, Py_ssize_t nused):
         if self.has_usecols and self.names is not None:
             if len(self.names) == len(self.usecols):
-                return self.names[nused]
+                return self._column_name_cleanup(self.names[nused])
             else:
-                return self.names[i - self.leading_cols]
+                return self._column_name_cleanup(self.names[i - self.leading_cols])
         else:
             if self.header is not None:
                 j = i - self.leading_cols
@@ -1243,7 +1732,7 @@ cdef class TextReader:
                 if j == len(self.header[0]):
                     return j
                 else:
-                    return self.header[0][j]
+                    return self._column_name_cleanup(self.header[0][j])
             else:
                 return None
 
@@ -1304,26 +1793,23 @@ def _maybe_upcast(arr):
 
 cdef _string_box_factorize(parser_t *parser, int col,
                            int line_start, int line_end,
-                           bint na_filter, kh_str_t *na_hashset):
+                           bint na_filter, kh_str_t *na_hashset,
+                           kh_str_t *na_value_counter):
     cdef:
         int error, na_count = 0
         Py_ssize_t i
         size_t lines
         coliter_t it
         const char *word = NULL
-        ndarray[object] result
 
         int ret = 0
         kh_strbox_t *table
 
         object pyval
 
-        object NA = na_values[np.object_]
         khiter_t k
 
-    table = kh_init_strbox()
     lines = line_end - line_start
-    result = np.empty(lines, dtype=np.object_)
     coliter_setup(&it, parser, col, line_start)
 
     for i in range(lines):
@@ -1334,50 +1820,35 @@ cdef _string_box_factorize(parser_t *parser, int col,
             # in the hash table
             if k != na_hashset.n_buckets:
                 na_count += 1
-                result[i] = NA
+                increment_counter_val(na_value_counter, word)
                 continue
 
-        k = kh_get_strbox(table, word)
-
-        # in the hash table
-        if k != table.n_buckets:
-            # this increments the refcount, but need to test
-            pyval = <object> table.vals[k]
-        else:
-            # box it. new ref?
-            pyval = PyBytes_FromString(word)
-
-            k = kh_put_strbox(table, word, &ret)
-            table.vals[k] = <PyObject*> pyval
-
-        result[i] = pyval
-
-    kh_destroy_strbox(table)
-
-    return result, na_count
+    return na_count
 
 cdef _string_box_utf8(parser_t *parser, int col,
                       int line_start, int line_end,
-                      bint na_filter, kh_str_t *na_hashset):
+                      bint na_filter, kh_str_t *na_hashset,
+                      kh_str_t *na_value_counter, bint return_data):
     cdef:
         int error, na_count = 0
         Py_ssize_t i
         size_t lines
         coliter_t it
         const char *word = NULL
-        ndarray[object] result
+        ndarray[object]  result
 
         int ret = 0
         kh_strbox_t *table
 
         object pyval
-
         object NA = na_values[np.object_]
         khiter_t k
 
-    table = kh_init_strbox()
     lines = line_end - line_start
-    result = np.empty(lines, dtype=np.object_)
+    if return_data:
+        table = kh_init_strbox()
+        result = np.empty(lines, dtype=np.object_)
+
     coliter_setup(&it, parser, col, line_start)
 
     for i in range(lines):
@@ -1388,39 +1859,39 @@ cdef _string_box_utf8(parser_t *parser, int col,
             # in the hash table
             if k != na_hashset.n_buckets:
                 na_count += 1
-                result[i] = NA
+                increment_counter_val(na_value_counter, word)
+                if return_data:
+                    result[i] = NA
                 continue
 
-        k = kh_get_strbox(table, word)
-
-        # in the hash table
-        if k != table.n_buckets:
-            # this increments the refcount, but need to test
-            pyval = <object> table.vals[k]
-        else:
-            # box it. new ref?
-            pyval = PyUnicode_FromString(word)
-
+        if return_data:
             k = kh_put_strbox(table, word, &ret)
-            table.vals[k] = <PyObject*> pyval
+            if ret == 0:
+                pyval = <object> table.vals[k]
+            else:
+                pyval = PyUnicode_FromString(word)
+                table.vals[k] = <PyObject*> pyval
 
-        result[i] = pyval
+            result[i] = pyval
 
-    kh_destroy_strbox(table)
+    if return_data:
+        kh_destroy_strbox(table)
+        return result, na_count
 
-    return result, na_count
+    return na_count
 
 cdef _string_box_decode(parser_t *parser, int col,
                         int line_start, int line_end,
                         bint na_filter, kh_str_t *na_hashset,
-                        char *encoding):
+                        char *encoding,
+                        kh_str_t *na_value_counter, bint return_data):
     cdef:
         int error, na_count = 0
         Py_ssize_t i, size
         size_t lines
         coliter_t it
         const char *word = NULL
-        ndarray[object] result
+        ndarray[object]  result
 
         int ret = 0
         kh_strbox_t *table
@@ -1428,13 +1899,14 @@ cdef _string_box_decode(parser_t *parser, int col,
         char *errors = "strict"
 
         object pyval
-
         object NA = na_values[np.object_]
         khiter_t k
 
-    table = kh_init_strbox()
     lines = line_end - line_start
-    result = np.empty(lines, dtype=np.object_)
+    if return_data:
+        table = kh_init_strbox()
+        result = np.empty(lines, dtype=np.object_)
+
     coliter_setup(&it, parser, col, line_start)
 
     for i in range(lines):
@@ -1445,96 +1917,58 @@ cdef _string_box_decode(parser_t *parser, int col,
             # in the hash table
             if k != na_hashset.n_buckets:
                 na_count += 1
-                result[i] = NA
+                increment_counter_val(na_value_counter, word)
+                if return_data:
+                    result[i] = NA
                 continue
 
-        k = kh_get_strbox(table, word)
-
-        # in the hash table
-        if k != table.n_buckets:
-            # this increments the refcount, but need to test
-            pyval = <object> table.vals[k]
-        else:
-            # box it. new ref?
-            size = strlen(word)
-            pyval = PyUnicode_Decode(word, size, encoding, errors)
-
+        if return_data:
             k = kh_put_strbox(table, word, &ret)
-            table.vals[k] = <PyObject*> pyval
+            if ret == 0:
+                pyval = <object> table.vals[k]
+            else:
+                pyval = PyUnicode_FromString(word)
+                table.vals[k] = <PyObject*> pyval
 
-        result[i] = pyval
+            result[i] = pyval
 
-    kh_destroy_strbox(table)
+    if return_data:
+        kh_destroy_strbox(table)
+        return result, na_count
 
-    return result, na_count
+    return na_count
 
-
-cdef _to_fw_string(parser_t *parser, int col, int line_start,
-                   int line_end, size_t width):
-    cdef:
-        Py_ssize_t i
-        coliter_t it
-        const char *word = NULL
-        char *data
-        ndarray result
-
-    result = np.empty(line_end - line_start, dtype='|S%d' % width)
-    data = <char*> result.data
-
-    with nogil:
-        _to_fw_string_nogil(parser, col, line_start, line_end, width, data)
-
-    return result
-
-cdef inline void _to_fw_string_nogil(parser_t *parser, int col, int line_start,
-                                     int line_end, size_t width, char *data) nogil:
-    cdef:
-        Py_ssize_t i
-        coliter_t it
-        const char *word = NULL
-
-    coliter_setup(&it, parser, col, line_start)
-
-    for i in range(line_end - line_start):
-        COLITER_NEXT(it, word)
-        strncpy(data, word, width)
-        data += width
 
 cdef char* cinf = b'inf'
 cdef char* cneginf = b'-inf'
 
 cdef _try_double(parser_t *parser, int col, int line_start, int line_end,
-                 bint na_filter, kh_str_t *na_hashset, object na_flist):
+                 bint na_filter, kh_str_t *na_hashset, object na_flist,
+                 kh_str_t *na_value_counter):
     cdef:
         int error, na_count = 0
         size_t i, lines
         coliter_t it
         const char *word = NULL
         char *p_end
-        double *data
         double NA = na_values[np.float64]
         kh_float64_t *na_fset
-        ndarray result
         khiter_t k
         bint use_na_flist = len(na_flist) > 0
 
     lines = line_end - line_start
-    result = np.empty(lines, dtype=np.float64)
-    data = <double *> result.data
-    na_fset = kset_float64_from_list(na_flist)
     with nogil:
         error = _try_double_nogil(parser, col, line_start, line_end,
-                                  na_filter, na_hashset, use_na_flist, na_fset, NA, data, &na_count)
-    kh_destroy_float64(na_fset)
+                                  na_filter, na_hashset, use_na_flist, &na_count,
+                                  na_value_counter)
     if error != 0:
-        return None, None
-    return result, na_count
+        return None
+    return na_count
 
 cdef inline int _try_double_nogil(parser_t *parser, int col, int line_start, int line_end,
                                   bint na_filter, kh_str_t *na_hashset, bint use_na_flist,
-                                  const kh_float64_t *na_flist,
-                                  double NA,
-                                  double *data, int *na_count) nogil:
+                                  int *na_count,
+                                  kh_str_t *na_value_counter) nogil:
     cdef:
         int error,
         size_t i
@@ -1557,70 +1991,36 @@ cdef inline int _try_double_nogil(parser_t *parser, int col, int line_start, int
             # in the hash table
             if k != na_hashset.n_buckets:
                 na_count[0] += 1
-                data[0] = NA
-            else:
-                data[0] = parser.converter(word, &p_end, parser.decimal, parser.sci,
-                                           parser.thousands, 1)
-                if errno != 0 or p_end[0] or p_end == word:
-                    if strcasecmp(word, cinf) == 0:
-                        data[0] = INF
-                    elif strcasecmp(word, cneginf) == 0:
-                        data[0] = NEGINF
-                    else:
-                        # Just return a non-zero value since the errno is never consumed.
-                        return 1
-                if use_na_flist:
-                    k64 = kh_get_float64(na_flist, data[0])
-                    if k64 != na_flist.n_buckets:
-                        na_count[0] += 1
-                        data[0] = NA
-            data += 1
-    else:
-        for i in range(lines):
-            COLITER_NEXT(it, word)
-            data[0] = parser.converter(word, &p_end, parser.decimal, parser.sci,
-                                       parser.thousands, 1)
-            if errno != 0 or p_end[0] or p_end == word:
-                if strcasecmp(word, cinf) == 0:
-                    data[0] = INF
-                elif strcasecmp(word, cneginf) == 0:
-                    data[0] = NEGINF
-                else:
-                    # Just return a non-zero value since the errno is never consumed.
-                    return 1
-            data += 1
+                increment_counter_val(na_value_counter, word)
 
     return 0
 
 cdef _try_int64(parser_t *parser, int col, int line_start, int line_end,
-                bint na_filter, kh_str_t *na_hashset):
+                bint na_filter, kh_str_t *na_hashset,
+                kh_str_t *na_value_counter):
     cdef:
         int error, na_count = 0
         size_t i, lines
         coliter_t it
-        int64_t *data
-        ndarray result
 
-        int64_t NA = na_values[np.int64]
         khiter_t k
 
     lines = line_end - line_start
-    result = np.empty(lines, dtype=np.int64)
-    data = <int64_t *> result.data
     coliter_setup(&it, parser, col, line_start)
     with nogil:
-        error = _try_int64_nogil(parser, col, line_start, line_end, na_filter, na_hashset, NA, data, &na_count)
+        error = _try_int64_nogil(parser, col, line_start, line_end, na_filter, na_hashset, &na_count,
+                                 na_value_counter)
     if error != 0:
         if error == ERROR_OVERFLOW:
             # Can't get the word variable
             raise OverflowError('Overflow')
-        return None, None
+        return None
 
-    return result, na_count
+    return na_count
 
 cdef inline int _try_int64_nogil(parser_t *parser, int col, int line_start, int line_end,
-                                 bint na_filter, const kh_str_t *na_hashset, int64_t NA, int64_t *data,
-                                 int *na_count) nogil:
+                                 bint na_filter, const kh_str_t *na_hashset,
+                                 int *na_count, kh_str_t *na_value_counter) nogil:
     cdef:
         int error
         size_t i
@@ -1639,45 +2039,29 @@ cdef inline int _try_int64_nogil(parser_t *parser, int col, int line_start, int 
             # in the hash table
             if k != na_hashset.n_buckets:
                 na_count[0] += 1
-                data[i] = NA
+                increment_counter_val(na_value_counter, word)
                 continue
-
-            data[i] = str_to_int64(word, INT64_MIN, INT64_MAX,
-                                   &error, parser.thousands)
-            if error != 0:
-                return error
-    else:
-        for i in range(lines):
-            COLITER_NEXT(it, word)
-            data[i] = str_to_int64(word, INT64_MIN, INT64_MAX,
-                                   &error, parser.thousands)
-            if error != 0:
-                return error
 
     return 0
 
 cdef _try_bool(parser_t *parser, int col, int line_start, int line_end,
-               bint na_filter, kh_str_t *na_hashset):
+               bint na_filter, kh_str_t *na_hashset, kh_str_t *na_value_counter,
+               kh_str_t *bool_true_format_counter, kh_str_t *bool_false_format_counter):
     cdef:
         int na_count
         size_t lines = line_end - line_start
-        uint8_t *data
-        cnp.ndarray[cnp.uint8_t, ndim=1] result
-
-        uint8_t NA = na_values[np.bool_]
-
-    result = np.empty(lines)
-    data = <uint8_t *> result.data
 
     with nogil:
-        error = _try_bool_nogil(parser, col, line_start, line_end, na_filter, na_hashset, NA, data, &na_count)
+        error = _try_bool_nogil(parser, col, line_start, line_end, na_filter, na_hashset, &na_count,
+                                na_value_counter, bool_true_format_counter, bool_false_format_counter)
     if error != 0:
-        return None, None
-    return result.view(np.bool_), na_count
+        return None
+    return na_count
 
 cdef inline int _try_bool_nogil(parser_t *parser, int col, int line_start, int line_end,
-                                bint na_filter, const kh_str_t *na_hashset, uint8_t NA, uint8_t *data,
-                                int *na_count) nogil:
+                                bint na_filter, const kh_str_t *na_hashset,
+                                int *na_count, kh_str_t *na_value_counter,
+                                kh_str_t *bool_true_format_counter, kh_str_t *bool_false_format_counter) nogil:
     cdef:
         int error
         size_t lines = line_end - line_start
@@ -1685,6 +2069,9 @@ cdef inline int _try_bool_nogil(parser_t *parser, int col, int line_start, int l
         coliter_t it
         const char *word = NULL
         khiter_t k
+        uint8_t data
+        kh_str_t *format_counter
+
     na_count[0] = 0
     coliter_setup(&it, parser, col, line_start)
 
@@ -1696,52 +2083,58 @@ cdef inline int _try_bool_nogil(parser_t *parser, int col, int line_start, int l
             # in the hash table
             if k != na_hashset.n_buckets:
                 na_count[0] += 1
-                data[0] = NA
-                data += 1
+                increment_counter_val(na_value_counter, word)
                 continue
 
-            error = to_boolean(word, data)
+            error = to_boolean(word, &data)
             if error != 0:
                 return error
-            data += 1
+            if data:
+                format_counter = bool_true_format_counter
+            else:
+                format_counter = bool_false_format_counter
+            increment_counter_val(format_counter, word)
     else:
         for i in range(lines):
             COLITER_NEXT(it, word)
 
-            error = to_boolean(word, data)
+            error = to_boolean(word, &data)
             if error != 0:
                 return error
-            data += 1
+            if data:
+                format_counter = bool_true_format_counter
+            else:
+                format_counter = bool_false_format_counter
+            increment_counter_val(format_counter, word)
     return 0
 
 cdef _try_bool_flex(parser_t *parser, int col, int line_start, int line_end,
                     bint na_filter, const kh_str_t *na_hashset,
-                    const kh_str_t *true_hashset, const kh_str_t *false_hashset):
+                    const kh_str_t *true_hashset, const kh_str_t *false_hashset,
+                    kh_str_t *na_value_counter, kh_str_t *bool_true_format_counter, kh_str_t *bool_false_format_counter):
     cdef:
         int error, na_count = 0
         size_t i, lines
         coliter_t it
         const char *word = NULL
-        uint8_t *data
         ndarray result
-
-        uint8_t NA = na_values[np.bool_]
         khiter_t k
 
     lines = line_end - line_start
-    result = np.empty(lines, dtype=np.uint8)
-    data = <uint8_t *> result.data
     with nogil:
         error = _try_bool_flex_nogil(parser, col, line_start, line_end, na_filter, na_hashset,
-                                     true_hashset, false_hashset, NA, data, &na_count)
+                                     true_hashset, false_hashset, &na_count,
+                                     na_value_counter, bool_true_format_counter, bool_false_format_counter)
     if error != 0:
-        return None, None
-    return result.view(np.bool_), na_count
+        return None
+    return na_count
 
 cdef inline int _try_bool_flex_nogil(parser_t *parser, int col, int line_start, int line_end,
                                      bint na_filter, const kh_str_t *na_hashset,
                                      const kh_str_t *true_hashset, const kh_str_t *false_hashset,
-                                     uint8_t NA, uint8_t *data, int *na_count) nogil:
+                                     int *na_count,
+                                     kh_str_t *na_value_counter, kh_str_t *bool_true_format_counter,
+                                     kh_str_t *bool_false_format_counter) nogil:
     cdef:
         int error = 0
         size_t i
@@ -1749,6 +2142,8 @@ cdef inline int _try_bool_flex_nogil(parser_t *parser, int col, int line_start, 
         coliter_t it
         const char *word = NULL
         khiter_t k
+        uint8_t data
+        kh_str_t *format_counter
 
     na_count[0] = 0
     coliter_setup(&it, parser, col, line_start)
@@ -1761,45 +2156,48 @@ cdef inline int _try_bool_flex_nogil(parser_t *parser, int col, int line_start, 
             # in the hash table
             if k != na_hashset.n_buckets:
                 na_count[0] += 1
-                data[0] = NA
-                data += 1
+                increment_counter_val(na_value_counter, word)
                 continue
 
             k = kh_get_str(true_hashset, word)
             if k != true_hashset.n_buckets:
-                data[0] = 1
-                data += 1
+                increment_counter_val(bool_true_format_counter, word)
                 continue
             k = kh_get_str(false_hashset, word)
             if k != false_hashset.n_buckets:
-                data[0] = 0
-                data += 1
+                increment_counter_val(bool_false_format_counter, word)
                 continue
 
-            error = to_boolean(word, data)
+            error = to_boolean(word, &data)
             if error != 0:
                 return error
-            data += 1
+            if data:
+                format_counter = bool_true_format_counter
+            else:
+                format_counter = bool_false_format_counter
+            increment_counter_val(format_counter, word)
     else:
         for i in range(lines):
             COLITER_NEXT(it, word)
 
             k = kh_get_str(true_hashset, word)
             if k != true_hashset.n_buckets:
-                data[0] = 1
-                data += 1
+                increment_counter_val(bool_true_format_counter, word)
                 continue
 
             k = kh_get_str(false_hashset, word)
             if k != false_hashset.n_buckets:
-                data[0] = 0
-                data += 1
+                increment_counter_val(bool_false_format_counter, word)
                 continue
 
-            error = to_boolean(word, data)
+            error = to_boolean(word, &data)
             if error != 0:
                 return error
-            data += 1
+            if data:
+                format_counter = bool_true_format_counter
+            else:
+                format_counter = bool_false_format_counter
+            increment_counter_val(format_counter, word)
 
     return 0
 
@@ -1865,75 +2263,6 @@ cdef raise_parser_error(object base, parser_t *parser):
     raise CParserError(message)
 
 
-def downcast_int64(ndarray[int64_t] arr, bint use_unsigned=0):
-    cdef:
-        Py_ssize_t i, n = len(arr)
-        int64_t mx = INT64_MIN + 1, mn = INT64_MAX
-        int64_t NA = na_values[np.int64]
-        int64_t val
-        ndarray[uint8_t] mask
-        int na_count = 0
-
-    _mask = np.empty(n, dtype=bool)
-    mask = _mask.view(np.uint8)
-
-    for i in range(n):
-        val = arr[i]
-
-        if val == NA:
-            mask[i] = 1
-            na_count += 1
-            continue
-
-        # not NA
-        mask[i] = 0
-
-        if val > mx:
-            mx = val
-
-        if val < mn:
-            mn = val
-
-    if mn >= 0 and use_unsigned:
-        if mx <= UINT8_MAX - 1:
-            result = arr.astype(np.uint8)
-            if na_count:
-                np.putmask(result, _mask, na_values[np.uint8])
-            return result
-
-        if mx <= UINT16_MAX - 1:
-            result = arr.astype(np.uint16)
-            if na_count:
-                np.putmask(result, _mask, na_values[np.uint16])
-            return result
-
-        if mx <= UINT32_MAX - 1:
-            result = arr.astype(np.uint32)
-            if na_count:
-                np.putmask(result, _mask, na_values[np.uint32])
-            return result
-
-    else:
-        if mn >= INT8_MIN + 1 and mx <= INT8_MAX:
-            result = arr.astype(np.int8)
-            if na_count:
-                np.putmask(result, _mask, na_values[np.int8])
-            return result
-
-        if mn >= INT16_MIN + 1 and mx <= INT16_MAX:
-            result = arr.astype(np.int16)
-            if na_count:
-                np.putmask(result, _mask, na_values[np.int16])
-            return result
-
-        if mn >= INT32_MIN + 1 and mx <= INT32_MAX:
-            result = arr.astype(np.int32)
-            if na_count:
-                np.putmask(result, _mask, na_values[np.int32])
-            return result
-
-    return arr
-
 
 def _concatenate_chunks(list chunks):
     cdef:
@@ -1962,6 +2291,16 @@ def _concatenate_chunks(list chunks):
           ])
         warnings.warn(warning_message, DtypeWarning, stacklevel=8)
     return result
+
+
+cdef inline void increment_counter_val(kh_str_t* m, kh_cstr_t key, size_t count=1) nogil:
+    cdef int rc
+    cdef int ix = kh_put_str(m, key, &rc)
+    if rc != 0:
+        m.keys[ix] = strdup(key)
+        m.vals[ix] = count
+    else:
+        m.vals[ix] += count
 
 #----------------------------------------------------------------------
 
@@ -2110,7 +2449,6 @@ cdef _fill_structured_column(char *dst, char* src, int elsize,
             memcpy(dst, src, elsize)
             dst += stride
             src += elsize
-
 
 
 def _maybe_encode(values):

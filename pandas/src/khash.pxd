@@ -53,6 +53,8 @@ cdef extern from "khash_python.h":
     inline khint_t kh_put_str(kh_str_t*, kh_cstr_t, int*) nogil
     inline void kh_del_str(kh_str_t*, khint_t) nogil
 
+    khint_t kh_begin_str(kh_str_t*) nogil
+    khint_t kh_end_str(kh_str_t*) nogil
     bint kh_exist_str(kh_str_t*, khiter_t) nogil
 
 
